@@ -133,7 +133,7 @@ internalToExternal s =
             literalValue = Nothing
         }
     }
-    flatVars = M.unionsWith (\_ last -> last) $ map mapStorage [sGlobalValues s, sLocalValues s, sPrefixValues s]
+    flatVars = M.unions $ map mapStorage [sPrefixValues s, sLocalValues s, sGlobalValues s]
 
 -- Conveniently get the state before a token id
 getIncomingState :: CFGAnalysis -> Id -> Maybe ProgramState
@@ -299,7 +299,6 @@ depsToState set = foldl insert newInternalState $ S.toList set
                     PrefixScope -> (sPrefixValues, insertPrefix)
                     LocalScope -> (sLocalValues, insertLocal)
                     GlobalScope -> (sGlobalValues, insertGlobal)
-                    DefaultScope -> error $ pleaseReport "Unresolved scope in dependency"
 
             alreadyExists = isJust $ vmLookup name $ mapToCheck state
         in
@@ -673,7 +672,7 @@ vmPatch base diff =
         _ | vmIsQuickEqual base diff -> diff
         _ -> VersionedMap {
             mapVersion = -1,
-            mapStorage = M.unionWith (flip const) (mapStorage base) (mapStorage diff)
+            mapStorage = M.union (mapStorage diff) (mapStorage base)
         }
 
 -- Set a variable. This includes properties. Applies it to the appropriate scope.
@@ -830,7 +829,7 @@ lookupStack' functionOnly get dep def ctx key = do
     f (s:rest) = do
         -- Go up the stack until we find the value, and add
         -- a dependency on each state (including where it was found)
-        res <- fromMaybe (f rest) (return <$> get (stackState s) key)
+        res <- maybe (f rest) return (get (stackState s) key)
         modifySTRef (dependencies s) $ S.insert $ dep key res
         return res
 
@@ -1120,34 +1119,34 @@ transferEffect ctx effect =
 
         CFSetProps scope name props ->
             case scope of
-                DefaultScope -> do
+                Nothing -> do
                     state <- readVariable ctx name
                     writeVariable ctx name $ addProperties props state
-                GlobalScope -> do
+                Just GlobalScope -> do
                     state <- readGlobal ctx name
                     writeGlobal ctx name $ addProperties props state
-                LocalScope -> do
+                Just LocalScope -> do
                     out <- readSTRef (cOutput ctx)
                     state <- readLocal ctx name
                     writeLocal ctx name $ addProperties props state
-                PrefixScope -> do
+                Just PrefixScope -> do
                     -- Prefix values become local
                     state <- readLocal ctx name
                     writeLocal ctx name $ addProperties props state
 
         CFUnsetProps scope name props ->
             case scope of
-                DefaultScope -> do
+                Nothing -> do
                     state <- readVariable ctx name
                     writeVariable ctx name $ removeProperties props state
-                GlobalScope -> do
+                Just GlobalScope -> do
                     state <- readGlobal ctx name
                     writeGlobal ctx name $ removeProperties props state
-                LocalScope -> do
+                Just LocalScope -> do
                     out <- readSTRef (cOutput ctx)
                     state <- readLocal ctx name
                     writeLocal ctx name $ removeProperties props state
-                PrefixScope -> do
+                Just PrefixScope -> do
                     -- Prefix values become local
                     state <- readLocal ctx name
                     writeLocal ctx name $ removeProperties props state
@@ -1287,7 +1286,7 @@ dataflow ctx entry = do
             else do
                 let (next, rest) = S.deleteFindMin ps
                 nexts <- process states next
-                writeSTRef pending $ foldl (flip S.insert) rest nexts
+                writeSTRef pending $ S.union (S.fromList nexts) rest
                 f (n-1) pending states
 
     process states node = do
@@ -1351,7 +1350,7 @@ analyzeControlFlow params t =
 
         -- All nodes we've touched
         invocations <- readSTRef $ cInvocations ctx
-        let invokedNodes = M.fromDistinctAscList $ map (\c -> (c, ())) $ S.toList $ M.keysSet $ groupByNode $ M.map snd invocations
+        let invokedNodes = M.fromSet (const ()) $ S.unions $ map (M.keysSet . snd) $ M.elems invocations
 
         -- Invoke all functions that were declared but not invoked
         -- This is so that we still get warnings for dead code
@@ -1374,7 +1373,7 @@ analyzeControlFlow params t =
 
         -- Fill in the map with unreachable states for anything we didn't get to
         let baseStates = M.fromDistinctAscList $ map (\c -> (c, (unreachableState, unreachableState))) $ uncurry enumFromTo $ nodeRange $ cfGraph cfg
-        let allStates = M.unionWith (flip const) baseStates invokedStates
+        let allStates = M.union invokedStates baseStates
 
         -- Convert to external states
         let nodeToData = M.map (\(a,b) -> (internalToExternal a, internalToExternal b)) allStates

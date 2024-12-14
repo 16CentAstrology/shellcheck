@@ -41,6 +41,7 @@ import Data.Char
 import Data.List
 import Data.Maybe
 import Data.Semigroup
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
 
 import Test.QuickCheck.All (forAllProperties)
@@ -103,7 +104,7 @@ data Parameters = Parameters {
     -- map from token id to start and end position
     tokenPositions     :: Map.Map Id (Position, Position),
     -- Result from Control Flow Graph analysis (including data flow analysis)
-    cfgAnalysis :: CF.CFGAnalysis
+    cfgAnalysis :: Maybe CF.CFGAnalysis
     } deriving (Show)
 
 -- TODO: Cache results of common AST ops here
@@ -196,8 +197,10 @@ makeCommentWithFix severity id code str fix =
         }
     in force withFix
 
+-- makeParameters :: CheckSpec -> Parameters
 makeParameters spec = params
   where
+    extendedAnalysis = fromMaybe True $ msum [asExtendedAnalysis spec, getExtendedAnalysisDirective root]
     params = Parameters {
         rootNode = root,
         shellType = fromMaybe (determineShell (asFallbackShell spec) root) $ asShellType spec,
@@ -206,18 +209,21 @@ makeParameters spec = params
             case shellType params of
                 Bash -> isOptionSet "lastpipe" root
                 Dash -> False
+                BusyboxSh -> False
                 Sh   -> False
                 Ksh  -> True,
         hasInheritErrexit =
             case shellType params of
                 Bash -> isOptionSet "inherit_errexit" root
                 Dash -> True
+                BusyboxSh -> True
                 Sh   -> True
                 Ksh  -> False,
         hasPipefail =
             case shellType params of
                 Bash -> isOptionSet "pipefail" root
                 Dash -> True
+                BusyboxSh -> isOptionSet "pipefail" root
                 Sh   -> True
                 Ksh  -> isOptionSet "pipefail" root,
         shellTypeSpecified = isJust (asShellType spec) || isJust (asFallbackShell spec),
@@ -225,7 +231,9 @@ makeParameters spec = params
         parentMap = getParentTree root,
         variableFlow = getVariableFlow params root,
         tokenPositions = asTokenPositions spec,
-        cfgAnalysis = CF.analyzeControlFlow cfParams root
+        cfgAnalysis = do
+            guard extendedAnalysis
+            return $ CF.analyzeControlFlow cfParams root
     }
     cfParams = CF.CFGParameters {
         CF.cfLastpipe = hasLastpipe params,
@@ -284,8 +292,8 @@ prop_determineShell7 = determineShellTest "#! /bin/ash" == Dash
 prop_determineShell8 = determineShellTest' (Just Ksh) "#!/bin/sh" == Sh
 prop_determineShell9 = determineShellTest "#!/bin/env -S dash -x" == Dash
 prop_determineShell10 = determineShellTest "#!/bin/env --split-string= dash -x" == Dash
-prop_determineShell11 = determineShellTest "#!/bin/busybox sh" == Dash -- busybox sh is a specific shell, not posix sh
-prop_determineShell12 = determineShellTest "#!/bin/busybox ash" == Dash
+prop_determineShell11 = determineShellTest "#!/bin/busybox sh" == BusyboxSh -- busybox sh is a specific shell, not posix sh
+prop_determineShell12 = determineShellTest "#!/bin/busybox ash" == BusyboxSh
 
 determineShellTest = determineShellTest' Nothing
 determineShellTest' fallbackShell = determineShell fallbackShell . fromJust . prRoot . pScript
@@ -333,14 +341,14 @@ isQuoteFree = isQuoteFreeNode False
 
 isQuoteFreeNode strict shell tree t =
     isQuoteFreeElement t ||
-        (fromMaybe False $ msum $ map isQuoteFreeContext $ drop 1 $ getPath tree t)
+        (fromMaybe False $ msum $ map isQuoteFreeContext $ NE.tail $ getPath tree t)
   where
     -- Is this node self-quoting in itself?
     isQuoteFreeElement t =
         case t of
-            T_Assignment {} -> assignmentIsQuoting t
-            T_FdRedirect {} -> True
-            _               -> False
+            T_Assignment id _ _ _ _ -> assignmentIsQuoting id
+            T_FdRedirect {}         -> True
+            _                       -> False
 
     -- Are any subnodes inherently self-quoting?
     isQuoteFreeContext t =
@@ -350,7 +358,7 @@ isQuoteFreeNode strict shell tree t =
             TC_Binary _ DoubleBracket _ _ _ -> return True
             TA_Sequence {}                  -> return True
             T_Arithmetic {}                 -> return True
-            T_Assignment {}                 -> return $ assignmentIsQuoting t
+            T_Assignment id _ _ _ _         -> return $ assignmentIsQuoting id
             T_Redirecting {}                -> return False
             T_DoubleQuoted _ _              -> return True
             T_DollarDoubleQuoted _ _        -> return True
@@ -365,11 +373,11 @@ isQuoteFreeNode strict shell tree t =
     -- Check whether this assignment is self-quoting due to being a recognized
     -- assignment passed to a Declaration Utility. This will soon be required
     -- by POSIX: https://austingroupbugs.net/view.php?id=351
-    assignmentIsQuoting t = shellParsesParamsAsAssignments || not (isAssignmentParamToCommand t)
+    assignmentIsQuoting id = shellParsesParamsAsAssignments || not (isAssignmentParamToCommand id)
     shellParsesParamsAsAssignments = shell /= Sh
 
     -- Is this assignment a parameter to a command like export/typeset/etc?
-    isAssignmentParamToCommand (T_Assignment id _ _ _ _) =
+    isAssignmentParamToCommand id =
         case Map.lookup id tree of
             Just (T_SimpleCommand _ _ (_:args)) -> id `elem` (map getId args)
             _ -> False
@@ -395,7 +403,7 @@ isParamTo tree cmd =
 -- Get the parent command (T_Redirecting) of a Token, if any.
 getClosestCommand :: Map.Map Id Token -> Token -> Maybe Token
 getClosestCommand tree t =
-    findFirst findCommand $ getPath tree t
+    findFirst findCommand $ NE.toList $ getPath tree t
   where
     findCommand t =
         case t of
@@ -409,7 +417,7 @@ getClosestCommandM t = do
     return $ getClosestCommand (parentMap params) t
 
 -- Is the token used as a command name (the first word in a T_SimpleCommand)?
-usedAsCommandName tree token = go (getId token) (tail $ getPath tree token)
+usedAsCommandName tree token = go (getId token) (NE.tail $ getPath tree token)
   where
     go currentId (T_NormalWord id [word]:rest)
         | currentId == getId word = go id rest
@@ -426,7 +434,9 @@ getPathM t = do
     return $ getPath (parentMap params) t
 
 isParentOf tree parent child =
-    elem (getId parent) . map getId $ getPath tree child
+    any (\t -> parentId == getId t) (getPath tree child)
+  where
+    parentId = getId parent
 
 parents params = getPath (parentMap params)
 
@@ -525,7 +535,9 @@ getModifiedVariables t =
         T_BatsTest {} -> [
             (t, t, "lines", DataArray SourceExternal),
             (t, t, "status", DataString SourceInteger),
-            (t, t, "output", DataString SourceExternal)
+            (t, t, "output", DataString SourceExternal),
+            (t, t, "stderr", DataString SourceExternal),
+            (t, t, "stderr_lines", DataArray SourceExternal)
             ]
 
         -- Count [[ -v foo ]] as an "assignment".
@@ -547,8 +559,12 @@ getModifiedVariables t =
         T_FdRedirect _ ('{':var) op -> -- {foo}>&2 modifies foo
             [(t, t, takeWhile (/= '}') var, DataString SourceInteger) | not $ isClosingFileOp op]
 
-        T_CoProc _ name _ ->
-            [(t, t, fromMaybe "COPROC" name, DataArray SourceInteger)]
+        T_CoProc _ Nothing _ ->
+            [(t, t, "COPROC", DataArray SourceInteger)]
+
+        T_CoProc _ (Just token) _ -> do
+            name <- maybeToList $ getLiteralString token
+            [(t, t, name, DataArray SourceInteger)]
 
         --Points to 'for' rather than variable
         T_ForIn id str [] _ -> [(t, t, str, DataString SourceExternal)]
@@ -810,7 +826,7 @@ getReferencedVariables parents t =
             return (context, token, getBracedReference str)
 
     isArithmeticAssignment t = case getPath parents t of
-        this: TA_Assignment _ "=" lhs _ :_ -> lhs == t
+        this NE.:| TA_Assignment _ "=" lhs _ :_ -> lhs == t
         _                                  -> False
 
 isDereferencingBinaryOp = (`elem` ["-eq", "-ne", "-lt", "-le", "-gt", "-ge"])
@@ -892,15 +908,6 @@ supportsArrays Bash = True
 supportsArrays Ksh = True
 supportsArrays _ = False
 
--- Returns true if the shell is Bash or Ksh (sorry for the name, Ksh)
-isBashLike :: Parameters -> Bool
-isBashLike params =
-    case shellType params of
-        Bash -> True
-        Ksh -> True
-        Dash -> False
-        Sh -> False
-
 isTrueAssignmentSource c =
     case c of
         DataString SourceChecked -> False
@@ -918,6 +925,14 @@ modifiesVariable params token name =
             Assignment (_, _, n, source) -> isTrueAssignmentSource source && n == name
             _ -> False
 
+isTestCommand t =
+    case t of
+        T_Condition {} -> True
+        T_SimpleCommand {} -> t `isCommand` "test"
+        T_Redirecting _ _ t -> isTestCommand t
+        T_Annotation _ _ t -> isTestCommand t
+        T_Pipeline _ _ [t] -> isTestCommand t
+        _ -> False
 
 return []
 runTests =  $( [| $(forAllProperties) (quickCheckWithResult (stdArgs { maxSuccess = 1 }) ) |])

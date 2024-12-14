@@ -19,6 +19,7 @@
 -}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE ViewPatterns #-}
 module ShellCheck.Checks.ShellSupport (checker , ShellCheck.Checks.ShellSupport.runTests) where
 
 import ShellCheck.AST
@@ -75,12 +76,11 @@ verifyNot c s = producesComments (testChecker c) s == Just False
 prop_checkForDecimals1 = verify checkForDecimals "((3.14*c))"
 prop_checkForDecimals2 = verify checkForDecimals "foo[1.2]=bar"
 prop_checkForDecimals3 = verifyNot checkForDecimals "declare -A foo; foo[1.2]=bar"
-checkForDecimals = ForShell [Sh, Dash, Bash] f
+checkForDecimals = ForShell [Sh, Dash, BusyboxSh, Bash] f
   where
     f t@(TA_Expansion id _) = sequence_ $ do
-        str <- getLiteralString t
-        first <- str !!! 0
-        guard $ isDigit first && '.' `elem` str
+        first:rest <- getLiteralString t
+        guard $ isDigit first && '.' `elem` rest
         return $ err id 2079 "(( )) doesn't support decimals. Use bc or awk."
     f _ = return ()
 
@@ -91,6 +91,9 @@ prop_checkBashisms3 = verify checkBashisms "echo $((i++))"
 prop_checkBashisms4 = verify checkBashisms "rm !(*.hs)"
 prop_checkBashisms5 = verify checkBashisms "source file"
 prop_checkBashisms6 = verify checkBashisms "[ \"$a\" == 42 ]"
+prop_checkBashisms6b = verify checkBashisms "test \"$a\" == 42"
+prop_checkBashisms6c = verify checkBashisms "[ foo =~ bar ]"
+prop_checkBashisms6d = verify checkBashisms "test foo =~ bar"
 prop_checkBashisms7 = verify checkBashisms "echo ${var[1]}"
 prop_checkBashisms8 = verify checkBashisms "echo ${!var[@]}"
 prop_checkBashisms9 = verify checkBashisms "echo ${!var*}"
@@ -106,6 +109,7 @@ prop_checkBashisms18 = verify checkBashisms "foo &> /dev/null"
 prop_checkBashisms19 = verify checkBashisms "foo > file*.txt"
 prop_checkBashisms20 = verify checkBashisms "read -ra foo"
 prop_checkBashisms21 = verify checkBashisms "[ -a foo ]"
+prop_checkBashisms21b = verify checkBashisms "test -a foo"
 prop_checkBashisms22 = verifyNot checkBashisms "[ foo -a bar ]"
 prop_checkBashisms23 = verify checkBashisms "trap mything ERR INT"
 prop_checkBashisms24 = verifyNot checkBashisms "trap mything INT TERM"
@@ -191,49 +195,91 @@ prop_checkBashisms101 = verify checkBashisms "read"
 prop_checkBashisms102 = verifyNot checkBashisms "read -r foo"
 prop_checkBashisms103 = verifyNot checkBashisms "read foo"
 prop_checkBashisms104 = verifyNot checkBashisms "read ''"
-checkBashisms = ForShell [Sh, Dash] $ \t -> do
+prop_checkBashisms105 = verifyNot checkBashisms "#!/bin/busybox sh\nset -o pipefail"
+prop_checkBashisms106 = verifyNot checkBashisms "#!/bin/busybox sh\nx=x\n[[ \"$x\" = \"$x\" ]]"
+prop_checkBashisms107 = verifyNot checkBashisms "#!/bin/busybox sh\nx=x\n[ \"$x\" == \"$x\" ]"
+prop_checkBashisms108 = verifyNot checkBashisms "#!/bin/busybox sh\necho magic &> /dev/null"
+prop_checkBashisms109 = verifyNot checkBashisms "#!/bin/busybox sh\ntrap stop EXIT SIGTERM"
+prop_checkBashisms110 = verifyNot checkBashisms "#!/bin/busybox sh\nsource /dev/null"
+prop_checkBashisms111 = verify checkBashisms "#!/bin/dash\nx='test'\n${x:0:3}" -- SC3057
+prop_checkBashisms112 = verifyNot checkBashisms "#!/bin/busybox sh\nx='test'\n${x:0:3}" -- SC3057
+prop_checkBashisms113 = verify checkBashisms "#!/bin/dash\nx='test'\n${x/st/xt}" -- SC3060
+prop_checkBashisms114 = verifyNot checkBashisms "#!/bin/busybox sh\nx='test'\n${x/st/xt}" -- SC3060
+prop_checkBashisms115 = verify checkBashisms "#!/bin/busybox sh\nx='test'\n${!x}" -- SC3053
+prop_checkBashisms116 = verify checkBashisms "#!/bin/busybox sh\nx='test'\n${x[1]}" -- SC3054
+prop_checkBashisms117 = verify checkBashisms "#!/bin/busybox sh\nx='test'\n${!x[@]}" -- SC3055
+prop_checkBashisms118 = verify checkBashisms "#!/bin/busybox sh\nxyz=1\n${!x*}" -- SC3056
+prop_checkBashisms119 = verify checkBashisms "#!/bin/busybox sh\nx='test'\n${x^^[t]}" -- SC3059
+prop_checkBashisms120 = verify checkBashisms "#!/bin/sh\n[ x == y ]"
+prop_checkBashisms121 = verifyNot checkBashisms "#!/bin/sh\n# shellcheck shell=busybox\n[ x == y ]"
+prop_checkBashisms122 = verify checkBashisms "#!/bin/dash\n$'a'"
+prop_checkBashisms123 = verifyNot checkBashisms "#!/bin/busybox sh\n$'a'"
+prop_checkBashisms124 = verify checkBashisms "#!/bin/dash\ntype -p test"
+prop_checkBashisms125 = verifyNot checkBashisms "#!/bin/busybox sh\ntype -p test"
+prop_checkBashisms126 = verifyNot checkBashisms "#!/bin/busybox sh\nread -p foo -r bar"
+prop_checkBashisms127 = verifyNot checkBashisms "#!/bin/busybox sh\necho -ne foo"
+checkBashisms = ForShell [Sh, Dash, BusyboxSh] $ \t -> do
     params <- ask
     kludge params t
  where
   -- This code was copy-pasted from Analytics where params was a variable
   kludge params = bashism
    where
-    isDash = shellType params == Dash
+    isBusyboxSh = shellType params == BusyboxSh
+    isDash = shellType params == Dash || isBusyboxSh
     warnMsg id code s =
         if isDash
         then err  id code $ "In dash, " ++ s ++ " not supported."
         else warn id code $ "In POSIX sh, " ++ s ++ " undefined."
+    asStr = getLiteralString
 
     bashism (T_ProcSub id _ _) = warnMsg id 3001 "process substitution is"
     bashism (T_Extglob id _ _) = warnMsg id 3002 "extglob is"
-    bashism (T_DollarSingleQuoted id _) = warnMsg id 3003 "$'..' is"
+    bashism (T_DollarSingleQuoted id _) =
+        unless isBusyboxSh $ warnMsg id 3003 "$'..' is"
     bashism (T_DollarDoubleQuoted id _) = warnMsg id 3004 "$\"..\" is"
     bashism (T_ForArithmetic id _ _ _ _) = warnMsg id 3005 "arithmetic for loops are"
     bashism (T_Arithmetic id _) = warnMsg id 3006 "standalone ((..)) is"
     bashism (T_DollarBracket id _) = warnMsg id 3007 "$[..] in place of $((..)) is"
     bashism (T_SelectIn id _ _ _) = warnMsg id 3008 "select loops are"
     bashism (T_BraceExpansion id _) = warnMsg id 3009 "brace expansion is"
-    bashism (T_Condition id DoubleBracket _) = warnMsg id 3010 "[[ ]] is"
+    bashism (T_Condition id DoubleBracket _) =
+        unless isBusyboxSh $ warnMsg id 3010 "[[ ]] is"
     bashism (T_HereString id _) = warnMsg id 3011 "here-strings are"
     bashism (TC_Binary id SingleBracket op _ _)
+        | op `elem` [ "<", ">", "\\<", "\\>", "<=", ">=", "\\<=", "\\>="] =
+            unless isDash $ warnMsg id 3012 $ "lexicographical " ++ op ++ " is"
+    bashism (T_SimpleCommand id _ [asStr -> Just "test", lhs, asStr -> Just op, rhs])
         | op `elem` [ "<", ">", "\\<", "\\>", "<=", ">=", "\\<=", "\\>="] =
             unless isDash $ warnMsg id 3012 $ "lexicographical " ++ op ++ " is"
     bashism (TC_Binary id SingleBracket op _ _)
         | op `elem` [ "-ot", "-nt", "-ef" ] =
             unless isDash $ warnMsg id 3013 $ op ++ " is"
+    bashism (T_SimpleCommand id _ [asStr -> Just "test", lhs, asStr -> Just op, rhs])
+        | op `elem` [ "-ot", "-nt", "-ef" ] =
+            unless isDash $ warnMsg id 3013 $ op ++ " is"
     bashism (TC_Binary id SingleBracket "==" _ _) =
-            warnMsg id 3014 "== in place of = is"
+        unless isBusyboxSh $ warnMsg id 3014 "== in place of = is"
+    bashism (T_SimpleCommand id _ [asStr -> Just "test", lhs, asStr -> Just "==", rhs]) =
+        unless isBusyboxSh $ warnMsg id 3014 "== in place of = is"
     bashism (TC_Binary id SingleBracket "=~" _ _) =
+            warnMsg id 3015 "=~ regex matching is"
+    bashism (T_SimpleCommand id _ [asStr -> Just "test", lhs, asStr -> Just "=~", rhs]) =
             warnMsg id 3015 "=~ regex matching is"
     bashism (TC_Unary id SingleBracket "-v" _) =
             warnMsg id 3016 "unary -v (in place of [ -n \"${var+x}\" ]) is"
+    bashism (T_SimpleCommand id _ [asStr -> Just "test", asStr -> Just "-v", _]) =
+            warnMsg id 3016 "unary -v (in place of [ -n \"${var+x}\" ]) is"
     bashism (TC_Unary id _ "-a" _) =
+            warnMsg id 3017 "unary -a in place of -e is"
+    bashism (T_SimpleCommand id _ [asStr -> Just "test", asStr -> Just "-a", _]) =
             warnMsg id 3017 "unary -a in place of -e is"
     bashism (TA_Unary id op _)
         | op `elem` [ "|++", "|--", "++|", "--|"] =
             warnMsg id 3018 $ filter (/= '|') op ++ " is"
     bashism (TA_Binary id "**" _ _) = warnMsg id 3019 "exponentials are"
-    bashism (T_FdRedirect id "&" (T_IoFile _ (T_Greater _) _)) = warnMsg id 3020 "&> is"
+    bashism (T_FdRedirect id "&" (T_IoFile _ (T_Greater _) _)) =
+        unless isBusyboxSh $ warnMsg id 3020 "&> is"
     bashism (T_FdRedirect id "" (T_IoFile _ (T_GREATAND _) file)) =
         unless (all isDigit $ onlyLiteralString file) $ warnMsg id 3021 ">& filename (as opposed to >& fd) is"
     bashism (T_FdRedirect id ('{':_) _) = warnMsg id 3022 "named file descriptors are"
@@ -253,7 +299,8 @@ checkBashisms = ForShell [Sh, Dash] $ \t -> do
         warnMsg id 3028 $ str ++ " is"
 
     bashism t@(T_DollarBraced id _ token) = do
-        mapM_ check expansion
+        unless isBusyboxSh $ mapM_ check simpleExpansions
+        mapM_ check advancedExpansions
         when (isBashVariable var) $
             warnMsg id 3028 $ var ++ " is"
       where
@@ -281,7 +328,11 @@ checkBashisms = ForShell [Sh, Dash] $ \t -> do
 
     bashism t@(T_SimpleCommand _ _ (cmd:arg:_))
         | t `isCommand` "echo" && argString `matches` flagRegex =
-            if isDash
+            if isBusyboxSh
+            then
+                unless (argString `matches` busyboxFlagRegex) $
+                    warnMsg (getId arg) 3036 "echo flags besides -n and -e"
+            else if isDash
             then
                 when (argString /= "-n") $
                     warnMsg (getId arg) 3036 "echo flags besides -n"
@@ -290,6 +341,7 @@ checkBashisms = ForShell [Sh, Dash] $ \t -> do
       where
           argString = concat $ oversimplify arg
           flagRegex = mkRegex "^-[eEsn]+$"
+          busyboxFlagRegex = mkRegex "^-[en]+$"
 
     bashism t@(T_SimpleCommand _ _ (cmd:arg:_))
         | getLiteralString cmd == Just "exec" && "-" `isPrefixOf` concat (oversimplify arg) =
@@ -363,7 +415,8 @@ checkBashisms = ForShell [Sh, Dash] $ \t -> do
                     (\x -> (not . null . snd $ x) && snd x `notElem` allowed) flags
                 return . warnMsg (getId word) 3045 $ name ++ " -" ++ flag ++ " is"
 
-            when (name == "source") $ warnMsg id 3046 "'source' in place of '.' is"
+            when (name == "source" && not isBusyboxSh) $
+                warnMsg id 3046 "'source' in place of '.' is"
             when (name == "trap") $
                 let
                     check token = sequence_ $ do
@@ -372,7 +425,7 @@ checkBashisms = ForShell [Sh, Dash] $ \t -> do
                         return $ do
                             when (upper `elem` ["ERR", "DEBUG", "RETURN"]) $
                                 warnMsg (getId token) 3047 $ "trapping " ++ str ++ " is"
-                            when ("SIG" `isPrefixOf` upper) $
+                            when (not isBusyboxSh && "SIG" `isPrefixOf` upper) $
                                 warnMsg (getId token) 3048
                                     "prefixing signal names with 'SIG' is"
                             when (not isDash && upper /= str) $
@@ -402,17 +455,19 @@ checkBashisms = ForShell [Sh, Dash] $ \t -> do
             ("hash", Just $ if isDash then ["r", "v"] else ["r"]),
             ("jobs", Just ["l", "p"]),
             ("printf", Just []),
-            ("read", Just $ if isDash then ["r", "p"] else ["r"]),
+            ("read", Just $ if isDash || isBusyboxSh then ["r", "p"] else ["r"]),
             ("readonly", Just ["p"]),
             ("trap", Just []),
-            ("type", Just []),
+            ("type", Just $ if isBusyboxSh then ["p"] else []),
             ("ulimit", if isDash then Nothing else Just ["f"]),
             ("umask", Just ["S"]),
             ("unset", Just ["f", "v"]),
             ("wait", Just [])
             ]
     bashism t@(T_SourceCommand id src _)
-        | getCommandName src == Just "source" = warnMsg id 3051 "'source' in place of '.' is"
+      | getCommandName src == Just "source" =
+          unless isBusyboxSh $
+            warnMsg id 3051 "'source' in place of '.' is"
     bashism (TA_Expansion _ (T_Literal id str : _))
         | str `matches` radix = warnMsg id 3052 "arithmetic base conversion is"
       where
@@ -420,14 +475,16 @@ checkBashisms = ForShell [Sh, Dash] $ \t -> do
     bashism _ = return ()
 
     varChars="_0-9a-zA-Z"
-    expansion = let re = mkRegex in [
+    advancedExpansions = let re = mkRegex in [
         (re $ "^![" ++ varChars ++ "]", 3053, "indirect expansion is"),
         (re $ "^[" ++ varChars ++ "]+\\[.*\\]$", 3054, "array references are"),
         (re $ "^![" ++ varChars ++ "]+\\[[*@]]$", 3055, "array key expansion is"),
         (re $ "^![" ++ varChars ++ "]+[*@]$", 3056, "name matching prefixes are"),
+        (re $ "^[" ++ varChars ++ "*@]+(\\[.*\\])?[,^]", 3059, "case modification is")
+        ]
+    simpleExpansions = let re = mkRegex in [
         (re $ "^[" ++ varChars ++ "*@]+:[^-=?+]", 3057, "string indexing is"),
         (re $ "^([*@][%#]|#[@*])", 3058, "string operations on $@/$* are"),
-        (re $ "^[" ++ varChars ++ "*@]+(\\[.*\\])?[,^]", 3059, "case modification is"),
         (re $ "^[" ++ varChars ++ "*@]+(\\[.*\\])?/", 3060, "string replacement is")
         ]
     bashVars = [
@@ -570,7 +627,7 @@ checkPS1Assignments = ForShell [Bash] f
 
 prop_checkMultipleBangs1 = verify checkMultipleBangs "! ! true"
 prop_checkMultipleBangs2 = verifyNot checkMultipleBangs "! true"
-checkMultipleBangs = ForShell [Dash, Sh] f
+checkMultipleBangs = ForShell [Dash, BusyboxSh, Sh] f
   where
     f token = case token of
         T_Banged id (T_Banged _ _) ->
@@ -581,7 +638,7 @@ checkMultipleBangs = ForShell [Dash, Sh] f
 prop_checkBangAfterPipe1 = verify checkBangAfterPipe "true | ! true"
 prop_checkBangAfterPipe2 = verifyNot checkBangAfterPipe "true | ( ! true )"
 prop_checkBangAfterPipe3 = verifyNot checkBangAfterPipe "! ! true | true"
-checkBangAfterPipe = ForShell [Dash, Sh, Bash] f
+checkBangAfterPipe = ForShell [Dash, BusyboxSh, Sh, Bash] f
   where
     f token = case token of
         T_Pipeline _ _ cmds -> mapM_ check cmds

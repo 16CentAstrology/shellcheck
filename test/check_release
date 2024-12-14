@@ -12,6 +12,17 @@ then
   fail "There are uncommitted changes"
 fi
 
+version=${current#v}
+if ! grep "Version:" ShellCheck.cabal | grep -qFw "$version"
+then
+  fail "The cabal file does not match tag version $version"
+fi
+
+if ! grep -qF "## $current" CHANGELOG.md
+then
+  fail "CHANGELOG.md does not contain '## $current'"
+fi
+
 current=$(git tag --points-at)
 if [[ -z "$current" ]]
 then
@@ -34,20 +45,14 @@ then
   fail "You are not on master"
 fi
 
-version=${current#v}
-if ! grep "Version:" ShellCheck.cabal | grep -qFw "$version"
-then
-  fail "The cabal file does not match tag version $version"
-fi
-
-if ! grep -qF "## $current" CHANGELOG.md
-then
-  fail "CHANGELOG.md does not contain '## $current'"
-fi
-
 if [[ $(git log -1 --pretty=%B) != "Stable version "* ]]
 then
   fail "Expected git log message to be 'Stable version ...'"
+fi
+
+if [[ $(git log -1 --pretty=%B) != *"CHANGELOG"* ]]
+then
+  fail "Expected git log message to contain CHANGELOG"
 fi
 
 i=1 j=1
@@ -56,11 +61,14 @@ cat << EOF
 Manual Checklist
 
 $((i++)). Make sure none of the automated checks above failed
+$((i++)). Run \`build/build_builder build/*/\` to update all builder images.
+$((j++)). \`build/run_builder dist-newstyle/sdist/ShellCheck-*.tar.gz build/*/\` to verify that they work.
+$((j++)). \`for f in \$(cat build/*/tag); do docker push "\$f"; done\` to upload them.
+$((i++)). Run test/distrotest to ensure that most distros can build OOTB.
 $((i++)). Make sure GitHub Build currently passes: https://github.com/koalaman/shellcheck/actions
 $((i++)). Make sure SnapCraft build currently works: https://build.snapcraft.io/user/koalaman
-$((i++)). Run test/distrotest to ensure that most distros can build OOTB.
 $((i++)). Format and read over the manual for bad formatting and outdated info.
-$((i++)). Make sure the Hackage package builds.
+$((i++)). Make sure the Hackage package builds locally.
 
 Release Steps
 

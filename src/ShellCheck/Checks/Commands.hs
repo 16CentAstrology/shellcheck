@@ -20,6 +20,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE MultiWayIf #-}
+{-# LANGUAGE PatternGuards #-}
 
 -- This module contains checks that examine specific commands by name.
 module ShellCheck.Checks.Commands (checker, optionalChecks, ShellCheck.Checks.Commands.runTests) where
@@ -42,6 +43,7 @@ import Data.Functor.Identity
 import qualified Data.Graph.Inductive.Graph as G
 import Data.List
 import Data.Maybe
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as M
 import qualified Data.Set as S
 import Test.QuickCheck.All (forAllProperties)
@@ -181,16 +183,15 @@ checkCommand :: M.Map CommandName (Token -> Analysis) -> Token -> Analysis
 checkCommand map t@(T_SimpleCommand id cmdPrefix (cmd:rest)) = sequence_ $ do
     name <- getLiteralString cmd
     return $
-        if '/' `elem` name
-        then
-            M.findWithDefault nullCheck (Basename $ basename name) map t
-        else if name == "builtin" && not (null rest) then
-            let t' = T_SimpleCommand id cmdPrefix rest
-                selectedBuiltin = fromMaybe "" $ getLiteralString . head $ rest
-            in M.findWithDefault nullCheck (Exactly selectedBuiltin) map t'
-        else do
-            M.findWithDefault nullCheck (Exactly name) map t
-            M.findWithDefault nullCheck (Basename name) map t
+        if | '/' `elem` name ->
+               M.findWithDefault nullCheck (Basename $ basename name) map t
+           | name == "builtin", (h:_) <- rest ->
+               let t' = T_SimpleCommand id cmdPrefix rest
+                   selectedBuiltin = onlyLiteralString h
+               in M.findWithDefault nullCheck (Exactly selectedBuiltin) map t'
+           | otherwise -> do
+               M.findWithDefault nullCheck (Exactly name) map t
+               M.findWithDefault nullCheck (Basename name) map t
 
   where
     basename = reverse . takeWhile (/= '/') . reverse
@@ -299,7 +300,7 @@ checkExpr = CommandCheck (Basename "expr") f where
                     "'expr' expects 3+ arguments but sees 1. Make sure each operator/operand is a separate argument, and escape <>&|."
 
             [first, second] |
-                (fromMaybe "" $ getLiteralString first) /= "length"
+                onlyLiteralString first /= "length"
                   && not (willSplit first || willSplit second) -> do
                     checkOp first
                     warn (getId t) 2307
@@ -930,7 +931,7 @@ prop_checkTimedCommand2 = verify checkTimedCommand "#!/bin/dash\ntime ( foo; bar
 prop_checkTimedCommand3 = verifyNot checkTimedCommand "#!/bin/sh\ntime sleep 1"
 checkTimedCommand = CommandCheck (Exactly "time") f where
     f (T_SimpleCommand _ _ (c:args@(_:_))) =
-        whenShell [Sh, Dash] $ do
+        whenShell [Sh, Dash, BusyboxSh] $ do
             let cmd = last args -- "time" is parsed with a command as argument
             when (isPiped cmd) $
                 warn (getId c) 2176 "'time' is undefined for pipelines. time single stage or bash -c instead."
@@ -954,7 +955,7 @@ checkTimedCommand = CommandCheck (Exactly "time") f where
 prop_checkLocalScope1 = verify checkLocalScope "local foo=3"
 prop_checkLocalScope2 = verifyNot checkLocalScope "f() { local foo=3; }"
 checkLocalScope = CommandCheck (Exactly "local") $ \t ->
-    whenShell [Bash, Dash] $ do -- Ksh allows it, Sh doesn't support local
+    whenShell [Bash, Dash, BusyboxSh] $ do -- Ksh allows it, Sh doesn't support local
         path <- getPathM t
         unless (any isFunctionLike path) $
             err (getId $ getCommandTokenOrThis t) 2168 "'local' is only valid in functions."
@@ -1005,8 +1006,8 @@ checkWhileGetoptsCase = CommandCheck (Exactly "getopts") f
         sequence_ $ do
             options <- getLiteralString arg1
             getoptsVar <- getLiteralString name
-            (T_WhileExpression _ _ body) <- findFirst whileLoop path
-            caseCmd@(T_CaseExpression _ var _) <- mapMaybe findCase body !!! 0
+            (T_WhileExpression _ _ body) <- findFirst whileLoop (NE.toList path)
+            T_CaseExpression id var list <- mapMaybe findCase body !!! 0
 
             -- Make sure getopts name and case variable matches
             [T_DollarBraced _ _ bracedWord] <- return $ getWordParts var
@@ -1016,11 +1017,11 @@ checkWhileGetoptsCase = CommandCheck (Exactly "getopts") f
             -- Make sure the variable isn't modified
             guard . not $ modifiesVariable params (T_BraceGroup (Id 0) body) getoptsVar
 
-            return $ check (getId arg1) (map (:[]) $ filter (/= ':') options) caseCmd
+            return $ check (getId arg1) (map (:[]) $ filter (/= ':') options) id list
     f _ = return ()
 
-    check :: Id -> [String] -> Token -> Analysis
-    check optId opts (T_CaseExpression id _ list) = do
+    check :: Id -> [String] -> Id -> [(CaseType, [Token], [Token])] -> Analysis
+    check optId opts id list = do
             unless (Nothing `M.member` handledMap) $ do
                 mapM_ (warnUnhandled optId id) $ catMaybes $ M.keys notHandled
 
@@ -1236,8 +1237,7 @@ checkSudoArgs = CommandCheck (Basename "sudo") f
   where
     f t = sequence_ $ do
         opts <- parseOpts $ arguments t
-        let nonFlags = [x | ("",(x, _)) <- opts]
-        commandArg <- nonFlags !!! 0
+        (_,(commandArg, _)) <- find (null . fst) opts
         command <- getLiteralString commandArg
         guard $ command `elem` builtins
         return $ warn (getId t) 2232 $ "Can't use sudo with builtins like " ++ command ++ ". Did you want sudo sh -c .. instead?"
@@ -1430,26 +1430,27 @@ prop_checkBackreferencingDeclaration6 = verify (checkBackreferencingDeclaration 
 prop_checkBackreferencingDeclaration7 = verify (checkBackreferencingDeclaration "declare") "declare x=var $k=$x"
 checkBackreferencingDeclaration cmd = CommandCheck (Exactly cmd) check
   where
-    check t = foldM_ perArg M.empty $ arguments t
+    check t = do
+        maybeCfga <- asks cfgAnalysis
+        mapM_ (\cfga -> foldM_ (perArg cfga) M.empty $ arguments t) maybeCfga
 
-    perArg leftArgs t =
+    perArg cfga leftArgs t =
         case t of
             T_Assignment id _ name idx t -> do
-                warnIfBackreferencing leftArgs $ t:idx
+                warnIfBackreferencing cfga leftArgs $ t:idx
                 return $ M.insert name id leftArgs
             t -> do
-                warnIfBackreferencing leftArgs [t]
+                warnIfBackreferencing cfga leftArgs [t]
                 return leftArgs
 
-    warnIfBackreferencing backrefs l = do
-        references <- findReferences l
+    warnIfBackreferencing cfga backrefs l = do
+        references <- findReferences cfga l
         let reused = M.intersection backrefs references
         mapM msg $ M.toList reused
 
     msg (name, id) = warn id 2318 $ "This assignment is used again in this '" ++ cmd ++ "', but won't have taken effect. Use two '" ++ cmd ++ "'s."
 
-    findReferences list = do
-        cfga <- asks cfgAnalysis
+    findReferences cfga list = do
         let graph = CF.graph cfga
         let nodesMap = CF.tokenToNodes cfga
         let nodes = S.unions $ map (\id -> M.findWithDefault S.empty id nodesMap) $ map getId $ list

@@ -1,13 +1,39 @@
 ## Git
 ### Added
+- SC2327/SC2328: Warn about capturing the output of redirected commands.
+- SC2329: Warn when (non-escaping) functions are never invoked.
+- SC2330: Warn about unsupported glob matches with [[ .. ]] in BusyBox.
+- Precompiled binaries for Linux riscv64 (linux.riscv64)
+### Changed
+- SC2002 about Useless Use Of Cat is now disabled by default. It can be
+  re-enabled with `--enable=useless-use-of-cat` or equivalent directive.
+- SC2015 about `A && B || C` no longer triggers when B is a test command.
+### Fixed
+- SC2218 about function use-before-define is now more accurate.
+- SC2317 about unreachable commands is now less spammy for nested ones.
+- SC2292, optional suggestion for [[ ]], now triggers for Busybox.
+
+
+## v0.10.0 - 2024-03-07
+### Added
+- Precompiled binaries for macOS ARM64 (darwin.aarch64)
+- Added support for busybox sh
+- Added flag --rcfile to specify an rc file by name.
+- Added `extended-analysis=true` directive to enable/disable dataflow analysis
+  (with a corresponding --extended-analysis flag).
 - SC2324: Warn when x+=1 appends instead of increments
 - SC2325: Warn about multiple `!`s in dash/sh.
 - SC2326: Warn about `foo | ! bar` in bash/dash/sh.
+- SC3012: Warn about lexicographic-compare bashism in test like in [ ]
+- SC3013: Warn bashism `test _ -op/-nt/-ef _` like in [ ]
+- SC3014: Warn bashism `test _ == _` like in [ ]
+- SC3015: Warn bashism `test _ =~ _` like in [ ]
+- SC3016: Warn bashism `test -v _` like in [ ]
+- SC3017: Warn bashism `test -a _` like in [ ]
 
 ### Fixed
 - source statements with here docs now work correctly
-
-### Changed
+- "(Array.!): undefined array element" error should no longer occur
 
 
 ## v0.9.0 - 2022-12-12

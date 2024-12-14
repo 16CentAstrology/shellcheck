@@ -62,6 +62,9 @@ internalVariables = [
     , "FLAGS_ARGC", "FLAGS_ARGV", "FLAGS_ERROR", "FLAGS_FALSE", "FLAGS_HELP",
     "FLAGS_PARENT", "FLAGS_RESERVED", "FLAGS_TRUE", "FLAGS_VERSION",
     "flags_error", "flags_return"
+
+    -- Bats
+    ,"stderr", "stderr_lines"
   ]
 
 specialIntegerVariables = [
@@ -156,6 +159,9 @@ shellForExecutable name =
         "sh"    -> return Sh
         "bash"  -> return Bash
         "bats"  -> return Bash
+        "busybox"  -> return BusyboxSh -- Used for directives and --shell=busybox
+        "busybox sh"  -> return BusyboxSh
+        "busybox ash"  -> return BusyboxSh
         "dash"  -> return Dash
         "ash"   -> return Dash -- There's also a warning for this.
         "ksh"   -> return Ksh

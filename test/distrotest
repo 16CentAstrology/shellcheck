@@ -17,13 +17,13 @@ and is still highly experimental.
 Make sure you're plugged in and have screen/tmux in place,
 then re-run with $0 --run to continue.
 
-Also note that dist* will be deleted.
+Also note that dist*/ and .stack-work/ will be deleted.
 EOF
 exit 0
 }
 
-echo "Deleting 'dist' and 'dist-newstyle'..."
-rm -rf dist dist-newstyle
+echo "Deleting 'dist', 'dist-newstyle', and '.stack-work'..."
+rm -rf dist dist-newstyle .stack-work
 
 execs=$(find . -name shellcheck)
 
@@ -74,13 +74,12 @@ fedora:latest         dnf install -y cabal-install ghc-template-haskell-devel fi
 archlinux:latest      pacman -S -y --noconfirm cabal-install ghc-static base-devel
 
 # Ubuntu LTS
+ubuntu:24.04          apt-get update && apt-get install -y cabal-install
 ubuntu:22.04          apt-get update && apt-get install -y cabal-install
 ubuntu:20.04          apt-get update && apt-get install -y cabal-install
-ubuntu:18.04          apt-get update && apt-get install -y cabal-install
-ubuntu:16.04          apt-get update && apt-get install -y cabal-install
 
 # Stack on Ubuntu LTS
-ubuntu:22.04          set -e; apt-get update && apt-get install -y curl && curl -sSL https://get.haskellstack.org/ | sh -s - -f && cd /mnt && exec test/stacktest
+ubuntu:24.04          set -e; apt-get update && apt-get install -y curl && curl -sSL https://get.haskellstack.org/ | sh -s - -f && cd /mnt && exec test/stacktest
 EOF
 
 exit "$final"

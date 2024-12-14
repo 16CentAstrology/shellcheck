@@ -31,6 +31,7 @@ import Data.Functor
 import Data.Functor.Identity
 import Data.List
 import Data.Maybe
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map as Map
 import Numeric (showHex)
 
@@ -157,9 +158,10 @@ isFlag token =
         _ -> False
 
 -- Is this token a flag where the - is unquoted?
-isUnquotedFlag token = fromMaybe False $ do
-    str <- getLeadingUnquotedString token
-    return $ "-" `isPrefixOf` str
+isUnquotedFlag token =
+    case getLeadingUnquotedString token of
+        Just ('-':_) -> True
+        _ -> False
 
 -- getGnuOpts "erd:u:" will parse a list of arguments tokens like `read`
 --     -re -d : -u 3 bar
@@ -758,8 +760,8 @@ prop_executableFromShebang6 = executableFromShebang "/usr/bin/env --split-string
 prop_executableFromShebang7 = executableFromShebang "/usr/bin/env --split-string bash -x" == "bash"
 prop_executableFromShebang8 = executableFromShebang "/usr/bin/env --split-string foo=bar bash -x" == "bash"
 prop_executableFromShebang9 = executableFromShebang "/usr/bin/env foo=bar dash" == "dash"
-prop_executableFromShebang10 = executableFromShebang "/bin/busybox sh" == "ash"
-prop_executableFromShebang11 = executableFromShebang "/bin/busybox ash" == "ash"
+prop_executableFromShebang10 = executableFromShebang "/bin/busybox sh" == "busybox sh"
+prop_executableFromShebang11 = executableFromShebang "/bin/busybox ash" == "busybox ash"
 
 -- Get the shell executable from a string like '/usr/bin/env bash'
 executableFromShebang :: String -> String
@@ -776,7 +778,8 @@ executableFromShebang = shellFor
             [x] -> basename x
             (first:second:args) | basename first == "busybox" ->
                 case basename second of
-                   "sh" -> "ash" -- busybox sh is ash
+                   "sh" -> "busybox sh"
+                   "ash" -> "busybox ash"
                    x -> x
             (first:args) | basename first == "env" ->
                 fromEnvArgs args
@@ -856,8 +859,7 @@ getBracedModifier s = headOrDefault "" $ do
 -- Get the variables from indices like ["x", "y"] in ${var[x+y+1]}
 prop_getIndexReferences1 = getIndexReferences "var[x+y+1]" == ["x", "y"]
 getIndexReferences s = fromMaybe [] $ do
-    match <- matchRegex re s
-    index <- match !!! 0
+    index:_ <- matchRegex re s
     return $ matchAllStrings variableNameRegex index
   where
     re = mkRegex "(\\[.*\\])"
@@ -868,8 +870,7 @@ prop_getOffsetReferences3 = getOffsetReferences "[foo]:bar" == ["bar"]
 prop_getOffsetReferences4 = getOffsetReferences "[foo]:bar:baz" == ["bar", "baz"]
 getOffsetReferences mods = fromMaybe [] $ do
 -- if mods start with [, then drop until ]
-    match <- matchRegex re mods
-    offsets <- match !!! 1
+    _:offsets:_ <- matchRegex re mods
     return $ matchAllStrings variableNameRegex offsets
   where
     re = mkRegex "^(\\[.+\\])? *:([^-=?+].*)"
@@ -896,10 +897,7 @@ getUnmodifiedParameterExpansion t =
         _ -> Nothing
 
 --- A list of the element and all its parents up to the root node.
-getPath tree t = t :
-    case Map.lookup (getId t) tree of
-        Nothing     -> []
-        Just parent -> getPath tree parent
+getPath tree = NE.unfoldr $ \t -> (t, Map.lookup (getId t) tree)
 
 isClosingFileOp op =
     case op of
@@ -911,6 +909,12 @@ getEnableDirectives root =
     case root of
         T_Annotation _ list _ -> [s | EnableComment s <- list]
         _ -> []
+
+getExtendedAnalysisDirective :: Token -> Maybe Bool
+getExtendedAnalysisDirective root =
+    case root of
+        T_Annotation _ list _ -> listToMaybe $ [s | ExtendedAnalysis s <- list]
+        _ -> Nothing
 
 return []
 runTests = $quickCheckAll

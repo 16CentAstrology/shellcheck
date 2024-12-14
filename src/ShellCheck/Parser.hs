@@ -46,6 +46,7 @@ import Text.Parsec.Error
 import Text.Parsec.Pos
 import qualified Control.Monad.Reader as Mr
 import qualified Control.Monad.State as Ms
+import qualified Data.List.NonEmpty as NE
 import qualified Data.Map.Strict as Map
 
 import Test.QuickCheck.All (quickCheckAll)
@@ -140,15 +141,9 @@ carriageReturn = do
     parseProblemAt pos ErrorC 1017 "Literal carriage return. Run script through tr -d '\\r' ."
     return '\r'
 
-almostSpace =
-    choice [
-        check '\xA0' "unicode non-breaking space",
-        check '\x200B' "unicode zerowidth space"
-    ]
-  where
-    check c name = do
-        parseNote ErrorC 1018 $ "This is a " ++ name ++ ". Delete and retype it."
-        char c
+almostSpace = do
+        parseNote ErrorC 1018 $ "This is a unicode space. Delete and retype it."
+        oneOf "\xA0\x2002\x2003\x2004\x2005\x2006\x2007\x2008\x2009\x200B\x202F"
         return ' '
 
 --------- Message/position annotation on top of user state
@@ -160,7 +155,7 @@ data Context =
     deriving (Show)
 
 data HereDocContext =
-        HereDocPending Token [Context] -- on linefeed, read this T_HereDoc
+        HereDocPending Id Dashed Quoted String [Context] -- on linefeed, read this T_HereDoc
     deriving (Show)
 
 data UserState = UserState {
@@ -238,12 +233,12 @@ addToHereDocMap id list = do
         hereDocMap = Map.insert id list map
     }
 
-addPendingHereDoc t = do
+addPendingHereDoc id d q str = do
     state <- getState
     context <- getCurrentContexts
     let docs = pendingHereDocs state
     putState $ state {
-        pendingHereDocs = HereDocPending t context : docs
+        pendingHereDocs = HereDocPending id d q str context : docs
     }
 
 popPendingHereDocs = do
@@ -826,7 +821,7 @@ readArithmeticContents =
         char ')'
         id <- endSpan start
         spacing
-        return $ TA_Parentesis id s
+        return $ TA_Parenthesis id s
 
     readArithTerm = readGroup <|> readVariable <|> readExpansion
 
@@ -1057,6 +1052,16 @@ readAnnotationWithoutPrefix sandboxed = do
                         "This shell type is unknown. Use e.g. sh or bash."
                 return [ShellOverride shell]
 
+            "extended-analysis" -> do
+                pos <- getPosition
+                value <- plainOrQuoted $ many1 letter
+                case value of
+                    "true" -> return [ExtendedAnalysis True]
+                    "false" -> return [ExtendedAnalysis False]
+                    _ -> do
+                        parseNoteAt pos ErrorC 1146 "Unknown extended-analysis value. Expected true/false."
+                        return []
+
             "external-sources" -> do
                 pos <- getPosition
                 value <- plainOrQuoted $ many1 letter
@@ -1194,7 +1199,7 @@ readDollarBracedPart = readSingleQuoted <|> readDoubleQuoted <|>
 
 readDollarBracedLiteral = do
     start <- startSpan
-    vars <- (readBraceEscaped <|> (anyChar >>= \x -> return [x])) `reluctantlyTill1` bracedQuotable
+    vars <- (readBraceEscaped <|> ((\x -> [x]) <$> anyChar)) `reluctantlyTill1` bracedQuotable
     id <- endSpan start
     return $ T_Literal id $ concat vars
 
@@ -1556,7 +1561,7 @@ readGenericLiteral endChars = do
     return $ concat strings
 
 readGenericLiteral1 endExp = do
-    strings <- (readGenericEscaped <|> (anyChar >>= \x -> return [x])) `reluctantlyTill1` endExp
+    strings <- (readGenericEscaped <|> ((\x -> [x]) <$> anyChar)) `reluctantlyTill1` endExp
     return $ concat strings
 
 readGenericEscaped = do
@@ -1835,7 +1840,7 @@ readHereDoc = called "here document" $ do
 
     -- add empty tokens for now, read the rest in readPendingHereDocs
     let doc = T_HereDoc hid dashed quoted endToken []
-    addPendingHereDoc doc
+    addPendingHereDoc hid dashed quoted endToken
     return doc
   where
     unquote :: String -> (Quoted, String)
@@ -1856,7 +1861,7 @@ readPendingHereDocs = do
     docs <- popPendingHereDocs
     mapM_ readDoc docs
   where
-    readDoc (HereDocPending (T_HereDoc id dashed quoted endToken _) ctx) =
+    readDoc (HereDocPending id dashed quoted endToken ctx) =
       swapContext ctx $
       do
         docStartPos <- getPosition
@@ -2370,7 +2375,7 @@ readPipeSequence = do
     return $ T_Pipeline id pipes cmds
   where
     sepBy1WithSeparators p s = do
-        let elems = p >>= \x -> return ([x], [])
+        let elems = (\x -> ([x], [])) <$> p
         let seps = do
             separator <- s
             return $ \(a,b) (c,d) -> (a++c, b ++ d ++ [separator])
@@ -2790,17 +2795,29 @@ readFunctionDefinition = called "function" $ do
 prop_readCoProc1 = isOk readCoProc "coproc foo { echo bar; }"
 prop_readCoProc2 = isOk readCoProc "coproc { echo bar; }"
 prop_readCoProc3 = isOk readCoProc "coproc echo bar"
+prop_readCoProc4 = isOk readCoProc "coproc a=b echo bar"
+prop_readCoProc5 = isOk readCoProc "coproc 'foo' { echo bar; }"
+prop_readCoProc6 = isOk readCoProc "coproc \"foo$$\" { echo bar; }"
+prop_readCoProc7 = isOk readCoProc "coproc 'foo' ( echo bar )"
+prop_readCoProc8 = isOk readCoProc "coproc \"foo$$\" while true; do true; done"
 readCoProc = called "coproc" $ do
     start <- startSpan
     try $ do
         string "coproc"
-        whitespace
+        spacing1
     choice [ try $ readCompoundCoProc start, readSimpleCoProc start ]
   where
     readCompoundCoProc start = do
-        var <- optionMaybe $
-            readVariableName `thenSkip` whitespace
-        body <- readBody readCompoundCommand
+        notFollowedBy2 readAssignmentWord
+        (var, body) <- choice [
+            try $ do
+                body <- readBody readCompoundCommand
+                return (Nothing, body),
+            try $ do
+                var <- readNormalWord `thenSkip` spacing
+                body <- readBody readCompoundCommand
+                return (Just var, body)
+            ]
         id <- endSpan start
         return $ T_CoProc id var body
     readSimpleCoProc start = do
@@ -2904,8 +2921,8 @@ readLetSuffix = many1 (readIoRedirect <|> try readLetExpression <|> readCmdWord)
     kludgeAwayQuotes :: String -> SourcePos -> (String, SourcePos)
     kludgeAwayQuotes s p =
         case s of
-            first:rest@(_:_) ->
-                let (last:backwards) = reverse rest
+            first:second:rest ->
+                let (last NE.:| backwards) = NE.reverse (second NE.:| rest)
                     middle = reverse backwards
                 in
                     if first `elem` "'\"" && first == last
@@ -3339,7 +3356,8 @@ readScriptFile sourced = do
                     verifyEof
                     let script = T_Annotation annotationId annotations $
                                     T_Script id shebang commands
-                    reparseIndices script
+                    userstate <- getState
+                    reparseIndices $ reattachHereDocs script (hereDocMap userstate)
                 else do
                     many anyChar
                     id <- endSpan start
@@ -3349,8 +3367,8 @@ readScriptFile sourced = do
     verifyShebang pos s = do
         case isValidShell s of
             Just True -> return ()
-            Just False -> parseProblemAt pos ErrorC 1071 "ShellCheck only supports sh/bash/dash/ksh scripts. Sorry!"
-            Nothing -> parseProblemAt pos ErrorC 1008 "This shebang was unrecognized. ShellCheck only supports sh/bash/dash/ksh. Add a 'shell' directive to specify."
+            Just False -> parseProblemAt pos ErrorC 1071 "ShellCheck only supports sh/bash/dash/ksh/'busybox sh' scripts. Sorry!"
+            Nothing -> parseProblemAt pos ErrorC 1008 "This shebang was unrecognized. ShellCheck only supports sh/bash/dash/ksh/'busybox sh'. Add a 'shell' directive to specify."
 
     isValidShell s =
         let good = null s || any (`isPrefixOf` s) goodShells
@@ -3366,6 +3384,7 @@ readScriptFile sourced = do
         "sh",
         "ash",
         "dash",
+        "busybox sh",
         "bash",
         "bats",
         "ksh"
@@ -3429,13 +3448,22 @@ isOk p s =      parsesCleanly p s == Just True   -- The string parses with no wa
 isWarning p s = parsesCleanly p s == Just False  -- The string parses with warnings
 isNotOk p s =   parsesCleanly p s == Nothing     -- The string does not parse
 
-parsesCleanly parser string = runIdentity $ do
-    (res, sys) <- runParser testEnvironment
-                    (parser >> eof >> getState) "-" string
-    case (res, sys) of
-        (Right userState, systemState) ->
-            return $ Just . null $ parseNotes userState ++ parseProblems systemState
-        (Left _, _) -> return Nothing
+-- If the parser matches the string, return Right [ParseNotes+ParseProblems]
+-- If it does not match the string,  return Left  [ParseProblems]
+getParseOutput parser string = runIdentity $ do
+    (res, systemState) <- runParser testEnvironment
+                            (parser >> eof >> getState) "-" string
+    return $ case res of
+        Right userState ->
+            Right $ parseNotes userState ++ parseProblems systemState
+        Left _ -> Left $ parseProblems systemState
+
+-- If the parser matches the string, return Just whether it was clean (without emitting suggestions)
+-- Otherwise, Nothing
+parsesCleanly parser string =
+    case getParseOutput parser string of
+        Right list -> Just $ null list
+        Left _ -> Nothing
 
 parseWithNotes parser = do
     item <- parser
@@ -3453,9 +3481,8 @@ makeErrorFor parsecError =
       pos = errorPos parsecError
 
 getStringFromParsec errors =
-        case map f errors of
-            r -> unwords (take 1 $ catMaybes $ reverse r)  ++
-                " Fix any mentioned problems and try again."
+        headOrDefault "" (mapMaybe f $ reverse errors)  ++
+            " Fix any mentioned problems and try again."
     where
         f err =
             case err of
@@ -3486,8 +3513,7 @@ parseShell env name contents = do
             return newParseResult {
                 prComments = map toPositionedComment $ nub $ parseNotes userstate ++ parseProblems state,
                 prTokenPositions = Map.map startEndPosToPos (positionMap userstate),
-                prRoot = Just $
-                    reattachHereDocs script (hereDocMap userstate)
+                prRoot = Just script
             }
         Left err -> do
             let context = contextStack state
@@ -3505,13 +3531,11 @@ parseShell env name contents = do
     -- A final pass for ignoring parse errors after failed parsing
     isIgnored stack note = any (contextItemDisablesCode False (codeForParseNote note)) stack
 
-notesForContext list = zipWith ($) [first, second] $ filter isName list
+notesForContext list = zipWith ($) [first, second] [(pos, str) | ContextName pos str <- list]
   where
-    isName (ContextName _ _) = True
-    isName _ = False
-    first (ContextName pos str) = ParseNote pos pos ErrorC 1073 $
+    first (pos, str) = ParseNote pos pos ErrorC 1073 $
         "Couldn't parse this " ++ str ++ ". Fix to allow more checks."
-    second (ContextName pos str) = ParseNote pos pos InfoC 1009 $
+    second (pos, str) = ParseNote pos pos InfoC 1009 $
         "The mentioned syntax error was in this " ++ str ++ "."
 
 -- Go over all T_UnparsedIndex and reparse them as either arithmetic or text
